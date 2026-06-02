@@ -3,69 +3,347 @@ const { createClient } = require("@supabase/supabase-js");
 require("dotenv").config();
 
 const app = express();
+
 app.use(express.json({ limit: "10mb" }));
+
+const BUCKET_NAME = "obby-replays";
+const LEADERBOARD_TABLE = "leaderboard";
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-app.post("/save-replay", async (req, res) => {
-  try {
-    const { userId, playerName, obbyId, timeTaken, replayData } = req.body;
+function getReplayPath(userId, obbyId) {
+  return `${String(obbyId)}/${String(userId)}.json`;
+}
 
-    if (!userId || !obbyId || timeTaken === undefined || replayData === undefined || replayData === null) {
-      return res.status(400).json({ error: "Missing required fields" });
+function getMetadataFromBody(body) {
+  return {
+    avgFPS: body.avgFPS ?? body.averageFPS ?? body.AverageFPS ?? null,
+    timeOfCompletion: body.timeOfCompletion ?? body.TimeOfCompletion ?? null,
+    completionData: body.completionData ?? body.CompletionData ?? {},
+  };
+}
+
+function normalizeReplayData(replayData) {
+  if (typeof replayData === "string") {
+    return replayData;
+  }
+
+  if (replayData === undefined || replayData === null) {
+    return "";
+  }
+
+  return JSON.stringify(replayData);
+}
+
+function extractReplayDataFromStoredFile(text) {
+  let parsed;
+
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {
+      replayData: text,
+      metadata: {},
+    };
+  }
+
+  if (typeof parsed === "string") {
+    return {
+      replayData: parsed,
+      metadata: {},
+    };
+  }
+
+  if (parsed && typeof parsed === "object") {
+    let replayData = "";
+
+    if (typeof parsed.replayData === "string") {
+      replayData = parsed.replayData;
+    } else if (typeof parsed.replay === "string") {
+      replayData = parsed.replay;
+    } else if (typeof parsed.encodedReplay === "string") {
+      replayData = parsed.encodedReplay;
+    } else if (typeof parsed.ReplayStack === "string") {
+      replayData = parsed.ReplayStack;
+    } else if (parsed.replayData !== undefined && parsed.replayData !== null) {
+      replayData = JSON.stringify(parsed.replayData);
+    } else {
+      replayData = JSON.stringify(parsed);
     }
 
-    const filePath = `${obbyId}/${userId}.json`;
+    return {
+      replayData,
+      metadata: parsed,
+    };
+  }
 
-    const { error: uploadError } = await supabase.storage
-      .from("obby-replays")
-      .upload(filePath, JSON.stringify(replayData), {
-        contentType: "application/json",
-        upsert: true,
+  return {
+    replayData: String(parsed ?? ""),
+    metadata: {},
+  };
+}
+
+async function saveLeaderboardRow({
+  userId,
+  playerName,
+  obbyId,
+  timeTaken,
+  replayPath,
+}) {
+  // Keep only one database row per user per obby.
+  const { error: deleteError } = await supabase
+    .from(LEADERBOARD_TABLE)
+    .delete()
+    .eq("player_id", String(userId))
+    .eq("obby_id", String(obbyId));
+
+  if (deleteError) {
+    return deleteError;
+  }
+
+  const { error: insertError } = await supabase
+    .from(LEADERBOARD_TABLE)
+    .insert({
+      player_id: String(userId),
+      player_name: playerName || null,
+      obby_id: String(obbyId),
+      time_taken: Number(timeTaken),
+      replay_path: replayPath,
     });
 
-    if (uploadError) {
-      return res.status(500).json({ error: uploadError.message });
+  return insertError;
+}
+
+async function loadReplay(userId, obbyId) {
+  if (!userId || !obbyId) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: "Missing userId or obbyId",
+      },
+    };
+  }
+
+  const replayPath = getReplayPath(userId, obbyId);
+
+  const { data: fileData, error: downloadError } = await supabase.storage
+    .from(BUCKET_NAME)
+    .download(replayPath);
+
+  if (downloadError) {
+    return {
+      status: 404,
+      body: {
+        success: false,
+        error: downloadError.message,
+        replayPath,
+      },
+    };
+  }
+
+  const fileText = await fileData.text();
+  const extracted = extractReplayDataFromStoredFile(fileText);
+
+  if (typeof extracted.replayData !== "string" || extracted.replayData === "") {
+    return {
+      status: 404,
+      body: {
+        success: false,
+        error: "Replay file exists, but replayData is empty",
+        replayPath,
+      },
+    };
+  }
+
+  const { data: leaderboardRows } = await supabase
+    .from(LEADERBOARD_TABLE)
+    .select("player_id, player_name, obby_id, time_taken, replay_path, created_at")
+    .eq("player_id", String(userId))
+    .eq("obby_id", String(obbyId))
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  const row = Array.isArray(leaderboardRows) ? leaderboardRows[0] : null;
+  const metadata = extracted.metadata || {};
+
+  const payload = {
+    success: true,
+
+    userId: String(userId),
+    obbyId: String(obbyId),
+    replayPath,
+
+    replayData: extracted.replayData,
+
+    playerName: row?.player_name ?? metadata.playerName ?? null,
+    timeTaken: row?.time_taken ?? metadata.timeTaken ?? null,
+    createdAt: row?.created_at ?? metadata.savedAt ?? null,
+
+    avgFPS: metadata.avgFPS ?? metadata.averageFPS ?? metadata.AverageFPS ?? null,
+    timeOfCompletion: metadata.timeOfCompletion ?? metadata.TimeOfCompletion ?? null,
+    completionData: metadata.completionData ?? metadata.CompletionData ?? {},
+  };
+
+  // Your Roblox loader checks both decoded.replayData and decoded.data.replayData,
+  // so this makes the response compatible with both formats.
+  payload.data = {
+    userId: payload.userId,
+    obbyId: payload.obbyId,
+    replayPath: payload.replayPath,
+    replayData: payload.replayData,
+    playerName: payload.playerName,
+    timeTaken: payload.timeTaken,
+    createdAt: payload.createdAt,
+    avgFPS: payload.avgFPS,
+    timeOfCompletion: payload.timeOfCompletion,
+    completionData: payload.completionData,
+  };
+
+  return {
+    status: 200,
+    body: payload,
+  };
+}
+
+app.get("/", (req, res) => {
+  res.send("Obby cloud backend is running");
+});
+
+app.post("/save-replay", async (req, res) => {
+  try {
+    const {
+      userId,
+      playerName,
+      obbyId,
+      timeTaken,
+      replayData,
+    } = req.body;
+
+    if (
+      !userId ||
+      !obbyId ||
+      timeTaken === undefined ||
+      replayData === undefined ||
+      replayData === null
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields",
+      });
     }
 
-    const { error: dbError } = await supabase
-      .from("leaderboard")
-      .insert({
-        player_id: String(userId),
-        player_name: playerName || null,
-        obby_id: String(obbyId),
-        time_taken: Number(timeTaken),
-        replay_path: filePath,
+    const replayPath = getReplayPath(userId, obbyId);
+    const metadata = getMetadataFromBody(req.body);
+
+    const replayFileBody = {
+      userId: String(userId),
+      playerName: playerName || null,
+      obbyId: String(obbyId),
+      timeTaken: Number(timeTaken),
+
+      replayData: normalizeReplayData(replayData),
+
+      avgFPS: metadata.avgFPS,
+      timeOfCompletion: metadata.timeOfCompletion,
+      completionData: metadata.completionData,
+
+      savedAt: new Date().toISOString(),
+    };
+
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(replayPath, JSON.stringify(replayFileBody), {
+        contentType: "application/json",
+        upsert: true,
       });
 
-    if (dbError) {
-      return res.status(500).json({ error: dbError.message });
+    if (uploadError) {
+      return res.status(500).json({
+        success: false,
+        error: uploadError.message,
+      });
     }
 
-    res.json({ success: true, replayPath: filePath });
+    const dbError = await saveLeaderboardRow({
+      userId,
+      playerName,
+      obbyId,
+      timeTaken,
+      replayPath,
+    });
+
+    if (dbError) {
+      return res.status(500).json({
+        success: false,
+        error: dbError.message,
+      });
+    }
+
+    res.json({
+      success: true,
+      replayPath,
+    });
   } catch (err) {
-    res.status(500).json({ error: String(err) });
+    res.status(500).json({
+      success: false,
+      error: String(err),
+    });
   }
+});
+
+app.get("/load-replay", async (req, res) => {
+  const result = await loadReplay(req.query.userId, req.query.obbyId);
+  res.status(result.status).json(result.body);
+});
+
+app.get("/get-replay", async (req, res) => {
+  const result = await loadReplay(req.query.userId, req.query.obbyId);
+  res.status(result.status).json(result.body);
+});
+
+app.get("/replay", async (req, res) => {
+  const result = await loadReplay(req.query.userId, req.query.obbyId);
+  res.status(result.status).json(result.body);
+});
+
+app.post("/load-replay", async (req, res) => {
+  const result = await loadReplay(req.body.userId, req.body.obbyId);
+  res.status(result.status).json(result.body);
+});
+
+app.get("/obby-replays/:obbyId/:fileName", async (req, res) => {
+  const userId = String(req.params.fileName).replace(/\.json$/i, "");
+  const obbyId = req.params.obbyId;
+
+  const result = await loadReplay(userId, obbyId);
+  res.status(result.status).json(result.body);
 });
 
 app.get("/leaderboard/:obbyId", async (req, res) => {
   const { obbyId } = req.params;
 
   const { data, error } = await supabase
-    .from("leaderboard")
+    .from(LEADERBOARD_TABLE)
     .select("id, player_id, player_name, obby_id, time_taken, replay_path, created_at")
     .eq("obby_id", obbyId)
     .order("time_taken", { ascending: true })
     .limit(50);
 
   if (error) {
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
   }
 
-  res.json(data);
+  res.json({
+    success: true,
+    rows: data,
+  });
 });
 
 const PORT = process.env.PORT || 3000;
