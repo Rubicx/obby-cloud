@@ -14,7 +14,7 @@ app.post("/save-replay", async (req, res) => {
   try {
     const { userId, playerName, obbyId, timeTaken, replayData } = req.body;
 
-    if (!userId || !obbyId || !timeTaken || !replayData) {
+    if (!userId || !obbyId || timeTaken === undefined || replayData === undefined || replayData === null) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
