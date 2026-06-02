@@ -18,13 +18,14 @@ app.post("/save-replay", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const filePath = `${obbyId}/${userId}/${Date.now()}.json`;
+    const filePath = `${obbyId}/${userId}.json`;
 
     const { error: uploadError } = await supabase.storage
       .from("obby-replays")
       .upload(filePath, JSON.stringify(replayData), {
         contentType: "application/json",
-      });
+        upsert: true,
+    });
 
     if (uploadError) {
       return res.status(500).json({ error: uploadError.message });
