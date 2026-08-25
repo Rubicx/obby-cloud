@@ -1,9 +1,18 @@
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
+const { createReplayWriteAuth } = require("./replayWriteAuth");
 require("dotenv").config();
 
 const app = express();
 
+const BACKEND_WRITE_SECRET = process.env.BACKEND_WRITE_SECRET || "";
+
+// Authenticate replay uploads before parsing their potentially large JSON bodies.
+// Replay reads stay public; deletion continues to use its existing credential.
+app.use(
+  "/save-replay",
+  createReplayWriteAuth(BACKEND_WRITE_SECRET)
+);
 app.use(express.json({ limit: "10mb" }));
 
 const BUCKET_NAME = process.env.SUPABASE_REPLAY_BUCKET || "obby-replays";
