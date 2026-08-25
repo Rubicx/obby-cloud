@@ -72,3 +72,8 @@ test("secret comparison requires non-empty strings and exact content", () => {
   assert.equal(secretsMatch("", ""), false);
   assert.equal(secretsMatch("same", undefined), false);
 });
+
+test("delete-style authorization also fails closed without configuration", () => {
+  assert.equal(secretsMatch("", "anything"), false);
+  assert.equal(secretsMatch(undefined, undefined), false);
+});

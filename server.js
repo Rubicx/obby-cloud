@@ -1,6 +1,10 @@
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
-const { createReplayWriteAuth } = require("./replayWriteAuth");
+const {
+  createReplayWriteAuth,
+  secretsMatch,
+} = require("./replayWriteAuth");
+const { saveLeaderboardRow } = require("./leaderboardStore");
 require("dotenv").config();
 
 const app = express();
@@ -107,42 +111,8 @@ function getDeleteSecretFromRequest(req) {
 }
 
 function isDeleteAuthorized(req) {
-  if (!REPLAY_DELETE_SECRET) {
-    return true;
-  }
-
-  return getDeleteSecretFromRequest(req) === REPLAY_DELETE_SECRET;
-}
-
-async function saveLeaderboardRow({
-  userId,
-  playerName,
-  obbyId,
-  timeTaken,
-  replayPath,
-}) {
-  // Keep only one database row per user per obby.
-  const { error: deleteError } = await supabase
-    .from(LEADERBOARD_TABLE)
-    .delete()
-    .eq("player_id", String(userId))
-    .eq("obby_id", String(obbyId));
-
-  if (deleteError) {
-    return deleteError;
-  }
-
-  const { error: insertError } = await supabase
-    .from(LEADERBOARD_TABLE)
-    .insert({
-      player_id: String(userId),
-      player_name: playerName || null,
-      obby_id: String(obbyId),
-      time_taken: Number(timeTaken),
-      replay_path: replayPath,
-    });
-
-  return insertError;
+  // Missing configuration must disable deletion instead of exposing it.
+  return secretsMatch(REPLAY_DELETE_SECRET, getDeleteSecretFromRequest(req));
 }
 
 async function deleteLeaderboardRows(userId, obbyId, replayPath) {
@@ -401,13 +371,17 @@ app.post("/save-replay", async (req, res) => {
       });
     }
 
-    const dbError = await saveLeaderboardRow({
-      userId,
-      playerName,
-      obbyId,
-      timeTaken,
-      replayPath,
-    });
+    const dbError = await saveLeaderboardRow(
+      supabase,
+      LEADERBOARD_TABLE,
+      {
+        userId,
+        playerName,
+        obbyId,
+        timeTaken,
+        replayPath,
+      }
+    );
 
     if (dbError) {
       return res.status(500).json({
@@ -522,6 +496,8 @@ app.get("/leaderboard/:obbyId", async (req, res) => {
     .select("id, player_id, player_name, obby_id, time_taken, replay_path, created_at")
     .eq("obby_id", obbyId)
     .order("time_taken", { ascending: true })
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(limit);
 
   if (error) {
