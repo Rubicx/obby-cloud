@@ -307,6 +307,11 @@ async function loadReplay(userId, obbyId) {
     avgFPS: metadata.avgFPS ?? metadata.averageFPS ?? metadata.AverageFPS ?? null,
     timeOfCompletion: metadata.timeOfCompletion ?? metadata.TimeOfCompletion ?? null,
     completionData: metadata.completionData ?? metadata.CompletionData ?? {},
+
+    obbyVersion: metadata.obbyVersion ?? metadata.ObbyVersion ?? null,
+    submissionId: metadata.submissionId ?? metadata.SubmissionId ?? null,
+    replayRevision: metadata.replayRevision ?? metadata.ReplayRevision ?? null,
+    replayDigest: metadata.replayDigest ?? metadata.ReplayDigest ?? null,
   };
 
   payload.data = {
@@ -320,6 +325,10 @@ async function loadReplay(userId, obbyId) {
     avgFPS: payload.avgFPS,
     timeOfCompletion: payload.timeOfCompletion,
     completionData: payload.completionData,
+    obbyVersion: payload.obbyVersion,
+    submissionId: payload.submissionId,
+    replayRevision: payload.replayRevision,
+    replayDigest: payload.replayDigest,
   };
 
   return {
@@ -363,6 +372,11 @@ app.post("/save-replay", async (req, res) => {
       playerName: playerName || null,
       obbyId: String(obbyId),
       timeTaken: Number(timeTaken),
+
+      obbyVersion: req.body.obbyVersion ?? req.body.ObbyVersion ?? null,
+      submissionId: req.body.submissionId ?? req.body.SubmissionId ?? null,
+      replayRevision: req.body.replayRevision ?? req.body.ReplayRevision ?? null,
+      replayDigest: req.body.replayDigest ?? req.body.ReplayDigest ?? null,
 
       replayData: normalizeReplayData(replayData),
 
@@ -498,13 +512,17 @@ app.get("/obby-replays/:obbyId/:fileName", async (req, res) => {
 
 app.get("/leaderboard/:obbyId", async (req, res) => {
   const { obbyId } = req.params;
+  const parsedLimit = Number.parseInt(req.query.limit, 10);
+  const limit = Number.isFinite(parsedLimit)
+    ? Math.min(Math.max(parsedLimit, 1), 100)
+    : 50;
 
   const { data, error } = await supabase
     .from(LEADERBOARD_TABLE)
     .select("id, player_id, player_name, obby_id, time_taken, replay_path, created_at")
     .eq("obby_id", obbyId)
     .order("time_taken", { ascending: true })
-    .limit(50);
+    .limit(limit);
 
   if (error) {
     return res.status(500).json({
@@ -515,6 +533,7 @@ app.get("/leaderboard/:obbyId", async (req, res) => {
 
   res.json({
     success: true,
+    limit,
     rows: data,
   });
 });
