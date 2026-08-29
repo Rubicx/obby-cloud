@@ -5,6 +5,7 @@ const {
   secretsMatch,
 } = require("./replayWriteAuth");
 const { saveLeaderboardRow } = require("./leaderboardStore");
+const { purgeObbyReplayData } = require("./obbyPurge");
 require("dotenv").config();
 
 const app = express();
@@ -104,6 +105,7 @@ function getDeleteSecretFromRequest(req) {
   return (
     req.get("x-backend-delete-secret") ||
     req.get("x-replay-delete-secret") ||
+    req.get("x-backend-write-secret") ||
     req.body?.deleteSecret ||
     req.query?.deleteSecret ||
     ""
@@ -112,7 +114,9 @@ function getDeleteSecretFromRequest(req) {
 
 function isDeleteAuthorized(req) {
   // Missing configuration must disable deletion instead of exposing it.
-  return secretsMatch(REPLAY_DELETE_SECRET, getDeleteSecretFromRequest(req));
+  const suppliedSecret = getDeleteSecretFromRequest(req);
+  return secretsMatch(REPLAY_DELETE_SECRET, suppliedSecret)
+    || secretsMatch(BACKEND_WRITE_SECRET, suppliedSecret);
 }
 
 async function deleteLeaderboardRows(userId, obbyId, replayPath) {
@@ -512,6 +516,23 @@ app.get("/leaderboard/:obbyId", async (req, res) => {
     limit,
     rows: data,
   });
+});
+
+app.post("/purge-obby-replays", async (req, res) => {
+  if (!isDeleteAuthorized(req)) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized purge request",
+    });
+  }
+
+  const result = await purgeObbyReplayData(supabase, {
+    bucketName: BUCKET_NAME,
+    leaderboardTable: LEADERBOARD_TABLE,
+    obbyId: req.body.obbyId,
+  });
+
+  res.status(result.status).json(result.body);
 });
 
 const PORT = process.env.PORT || 3000;
