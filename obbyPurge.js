@@ -1,5 +1,6 @@
 const STORAGE_LIST_PAGE_SIZE = 1000;
 const STORAGE_REMOVE_BATCH_SIZE = 1000;
+const { activateObbyVersion, normalizeObbyVersion } = require("./obbyVersionStore");
 
 function normalizeObbyId(value) {
   const obbyId = String(value ?? "").trim();
@@ -68,20 +69,29 @@ async function removeReplayPaths(supabase, bucketName, paths) {
 
 async function purgeObbyReplayData(
   supabase,
-  { bucketName, leaderboardTable, obbyId }
+  { bucketName, leaderboardTable, obbyId, replacementVersion }
 ) {
   const normalizedObbyId = normalizeObbyId(obbyId);
-  if (!normalizedObbyId) {
+  const normalizedReplacementVersion = normalizeObbyVersion(replacementVersion);
+  if (!normalizedObbyId || !normalizedReplacementVersion) {
     return {
       status: 400,
       body: {
         success: false,
-        error: "Invalid obbyId",
+        error: !normalizedObbyId ? "Invalid obbyId" : "Invalid replacementVersion",
       },
     };
   }
 
   try {
+    // Activate the new epoch first so still-running old game servers cannot
+    // repopulate the leaderboard while the replacement place is unpublished.
+    await activateObbyVersion(
+      supabase,
+      normalizedObbyId,
+      normalizedReplacementVersion
+    );
+
     const replayPaths = await listReplayPathsForObby(
       supabase,
       bucketName,
@@ -108,6 +118,7 @@ async function purgeObbyReplayData(
       body: {
         success: true,
         obbyId: normalizedObbyId,
+        replacementVersion: normalizedReplacementVersion,
         replayPathsFound: replayPaths.length,
         removedObjectCount: removedObjects.length,
         deletedRowCount: Array.isArray(deletedRows) ? deletedRows.length : 0,

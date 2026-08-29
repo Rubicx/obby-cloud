@@ -6,6 +6,10 @@ const {
 } = require("./replayWriteAuth");
 const { saveLeaderboardRow } = require("./leaderboardStore");
 const { purgeObbyReplayData } = require("./obbyPurge");
+const {
+  getExpectedObbyVersion,
+  normalizeObbyVersion,
+} = require("./obbyVersionStore");
 require("dotenv").config();
 
 const app = express();
@@ -340,6 +344,17 @@ app.post("/save-replay", async (req, res) => {
 
     const replayPath = getReplayPath(userId, obbyId);
     const metadata = getMetadataFromBody(req.body);
+    const obbyVersion = normalizeObbyVersion(
+      req.body.obbyVersion ?? req.body.ObbyVersion
+    );
+    const expectedObbyVersion = await getExpectedObbyVersion(supabase, obbyId);
+    if (expectedObbyVersion && obbyVersion !== expectedObbyVersion) {
+      return res.status(409).json({
+        success: false,
+        error: "Outdated obby version",
+        expectedObbyVersion,
+      });
+    }
 
     const replayFileBody = {
       userId: String(userId),
@@ -347,7 +362,7 @@ app.post("/save-replay", async (req, res) => {
       obbyId: String(obbyId),
       timeTaken: Number(timeTaken),
 
-      obbyVersion: req.body.obbyVersion ?? req.body.ObbyVersion ?? null,
+      obbyVersion,
       submissionId: req.body.submissionId ?? req.body.SubmissionId ?? null,
       replayRevision: req.body.replayRevision ?? req.body.ReplayRevision ?? null,
       replayDigest: req.body.replayDigest ?? req.body.ReplayDigest ?? null,
@@ -382,6 +397,7 @@ app.post("/save-replay", async (req, res) => {
         userId,
         playerName,
         obbyId,
+        obbyVersion,
         timeTaken,
         replayPath,
       }
@@ -495,14 +511,29 @@ app.get("/leaderboard/:obbyId", async (req, res) => {
     ? Math.min(Math.max(parsedLimit, 1), 100)
     : 50;
 
-  const { data, error } = await supabase
+  let expectedObbyVersion;
+  try {
+    expectedObbyVersion = await getExpectedObbyVersion(supabase, obbyId);
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  let query = supabase
     .from(LEADERBOARD_TABLE)
-    .select("id, player_id, player_name, obby_id, time_taken, replay_path, created_at")
+    .select("id, player_id, player_name, obby_id, obby_version, time_taken, replay_path, created_at")
     .eq("obby_id", obbyId)
     .order("time_taken", { ascending: true })
     .order("created_at", { ascending: true })
-    .order("id", { ascending: true })
-    .limit(limit);
+    .order("id", { ascending: true });
+
+  if (expectedObbyVersion) {
+    query = query.eq("obby_version", expectedObbyVersion);
+  }
+
+  const { data, error } = await query.limit(limit);
 
   if (error) {
     return res.status(500).json({
@@ -530,6 +561,7 @@ app.post("/purge-obby-replays", async (req, res) => {
     bucketName: BUCKET_NAME,
     leaderboardTable: LEADERBOARD_TABLE,
     obbyId: req.body.obbyId,
+    replacementVersion: req.body.replacementVersion,
   });
 
   res.status(result.status).json(result.body);

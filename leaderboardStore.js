@@ -1,12 +1,15 @@
 async function saveLeaderboardRow(
   supabase,
   leaderboardTable,
-  { userId, playerName, obbyId, timeTaken, replayPath }
+  { userId, playerName, obbyId, obbyVersion, timeTaken, replayPath }
 ) {
   const row = {
     player_id: String(userId),
     player_name: playerName || null,
     obby_id: String(obbyId),
+    obby_version: Number.isFinite(Number(obbyVersion)) && Number(obbyVersion) >= 1
+      ? Math.floor(Number(obbyVersion))
+      : null,
     time_taken: Number(timeTaken),
     replay_path: replayPath,
     created_at: new Date().toISOString(),

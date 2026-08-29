@@ -33,6 +33,14 @@ test("removes every replay object before deleting leaderboard rows", async () =>
       },
     },
     from(table) {
+      if (table === "obby_version_epochs") {
+        return {
+          async upsert(row, options) {
+            calls.push({ method: "version-upsert", table, row, options });
+            return { error: null };
+          },
+        };
+      }
       return {
         delete() {
           calls.push({ method: "delete", table });
@@ -57,21 +65,23 @@ test("removes every replay object before deleting leaderboard rows", async () =>
     bucketName: "obby-replays",
     leaderboardTable: "leaderboard",
     obbyId: "obby-123",
+    replacementVersion: 2,
   });
 
   assert.equal(result.status, 200);
   assert.equal(result.body.replayPathsFound, 2);
   assert.equal(result.body.removedObjectCount, 2);
   assert.equal(result.body.deletedRowCount, 2);
-  assert.deepEqual(calls[1].paths, [
+  assert.equal(calls[0].method, "version-upsert");
+  assert.deepEqual(calls[2].paths, [
     "obby-123/1.json",
     "obby-123/2.json",
   ]);
-  assert.equal(calls[2].method, "delete");
+  assert.equal(calls[3].method, "delete");
 });
 
 test("does not delete leaderboard rows when object removal fails", async () => {
-  let databaseTouched = false;
+  let leaderboardTouched = false;
   const supabase = {
     storage: {
       from() {
@@ -85,9 +95,16 @@ test("does not delete leaderboard rows when object removal fails", async () => {
         };
       },
     },
-    from() {
-      databaseTouched = true;
-      throw new Error("database should not be reached");
+    from(table) {
+      if (table === "obby_version_epochs") {
+        return {
+          async upsert() {
+            return { error: null };
+          },
+        };
+      }
+      leaderboardTouched = true;
+      throw new Error("leaderboard should not be reached");
     },
   };
 
@@ -95,8 +112,9 @@ test("does not delete leaderboard rows when object removal fails", async () => {
     bucketName: "obby-replays",
     leaderboardTable: "leaderboard",
     obbyId: "obby-123",
+    replacementVersion: 2,
   });
 
   assert.equal(result.status, 500);
-  assert.equal(databaseTouched, false);
+  assert.equal(leaderboardTouched, false);
 });
