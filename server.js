@@ -27,6 +27,11 @@ app.use(express.json({ limit: "10mb" }));
 const BUCKET_NAME = process.env.SUPABASE_REPLAY_BUCKET || "obby-replays";
 const LEADERBOARD_TABLE = process.env.SUPABASE_LEADERBOARD_TABLE || "leaderboard";
 const REPLAY_DELETE_SECRET = process.env.REPLAY_DELETE_SECRET || "";
+const LEADERBOARD_CACHE_TTL_MS = 15_000;
+const LEADERBOARD_CACHE_MAX_ENTRIES = 250;
+
+const leaderboardCache = new Map();
+const leaderboardLoads = new Map();
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -43,6 +48,143 @@ function getMetadataFromBody(body) {
     timeOfCompletion: body.timeOfCompletion ?? body.TimeOfCompletion ?? null,
     completionData: body.completionData ?? body.CompletionData ?? {},
   };
+}
+
+function getReplayStatusFromBody(body) {
+  const metadata = body && typeof body.metadata === "object" ? body.metadata : {};
+  const replayRemoved = body.replayRemoved === true || metadata.replayRemoved === true;
+  const explicitHasReplay = body.hasReplayData ?? metadata.hasReplayData;
+
+  return explicitHasReplay !== false && !replayRemoved;
+}
+
+function invalidateLeaderboardCache(obbyId) {
+  leaderboardCache.delete(String(obbyId));
+}
+
+function trimLeaderboardCache() {
+  while (leaderboardCache.size > LEADERBOARD_CACHE_MAX_ENTRIES) {
+    const oldestKey = leaderboardCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    leaderboardCache.delete(oldestKey);
+  }
+}
+
+async function loadLeaderboardSnapshot(obbyId, expectedObbyVersion) {
+  const cacheKey = String(obbyId);
+  const now = Date.now();
+  const cached = leaderboardCache.get(cacheKey);
+
+  if (
+    cached
+    && cached.expiresAt > now
+    && cached.expectedObbyVersion === expectedObbyVersion
+  ) {
+    // Refresh insertion order so the Map also acts as a small LRU.
+    leaderboardCache.delete(cacheKey);
+    leaderboardCache.set(cacheKey, cached);
+    return { rows: cached.rows, cacheHit: true };
+  }
+
+  if (cached) {
+    leaderboardCache.delete(cacheKey);
+  }
+
+  const activeLoad = leaderboardLoads.get(cacheKey);
+  if (activeLoad && activeLoad.expectedObbyVersion === expectedObbyVersion) {
+    const rows = await activeLoad.promise;
+    return { rows, cacheHit: true, coalesced: true };
+  }
+
+  const loadPromise = (async () => {
+    let query = supabase
+      .from(LEADERBOARD_TABLE)
+      .select([
+        "id",
+        "player_id",
+        "player_name",
+        "obby_id",
+        "obby_version",
+        "time_taken",
+        "replay_path",
+        "created_at",
+        "updated_at",
+        "average_fps",
+        "time_of_completion",
+        "completion_data",
+        "has_replay_data",
+        "replay_revision",
+        "replay_digest",
+        "submission_id",
+      ].join(", "))
+      .eq("obby_id", obbyId)
+      .order("time_taken", { ascending: true })
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true });
+
+    if (expectedObbyVersion) {
+      query = query.eq("obby_version", expectedObbyVersion);
+    }
+
+    const { data, error } = await query.limit(100);
+    if (error) {
+      throw error;
+    }
+
+    const rows = Array.isArray(data) ? data : [];
+    leaderboardCache.set(cacheKey, {
+      rows,
+      expectedObbyVersion,
+      expiresAt: Date.now() + LEADERBOARD_CACHE_TTL_MS,
+    });
+    trimLeaderboardCache();
+    return rows;
+  })();
+
+  leaderboardLoads.set(cacheKey, {
+    expectedObbyVersion,
+    promise: loadPromise,
+  });
+
+  try {
+    return { rows: await loadPromise, cacheHit: false };
+  } finally {
+    const current = leaderboardLoads.get(cacheKey);
+    if (current && current.promise === loadPromise) {
+      leaderboardLoads.delete(cacheKey);
+    }
+  }
+}
+
+async function backfillLeaderboardMetadata(userId, obbyId, replayPath, payload) {
+  const update = {
+    player_name: payload.playerName ?? null,
+    replay_path: replayPath,
+    average_fps: Number.isFinite(Number(payload.avgFPS)) ? Number(payload.avgFPS) : null,
+    time_of_completion: Number.isFinite(Number(payload.timeOfCompletion))
+      ? Math.floor(Number(payload.timeOfCompletion))
+      : null,
+    completion_data: payload.completionData && typeof payload.completionData === "object"
+      ? payload.completionData
+      : {},
+    has_replay_data: payload.hasReplayData !== false,
+    replay_revision: payload.replayRevision ? String(payload.replayRevision) : null,
+    replay_digest: payload.replayDigest ? String(payload.replayDigest) : null,
+    submission_id: payload.submissionId ? String(payload.submissionId) : null,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { error } = await supabase
+    .from(LEADERBOARD_TABLE)
+    .update(update)
+    .eq("player_id", String(userId))
+    .eq("obby_id", String(obbyId));
+
+  if (!error) {
+    invalidateLeaderboardCache(obbyId);
+  }
 }
 
 function normalizeReplayData(replayData) {
@@ -203,6 +345,8 @@ async function deleteReplay(userId, obbyId) {
     };
   }
 
+  invalidateLeaderboardCache(obbyId);
+
   return {
     status: 200,
     body: {
@@ -260,7 +404,21 @@ async function loadReplay(userId, obbyId) {
 
   const { data: leaderboardRows } = await supabase
     .from(LEADERBOARD_TABLE)
-    .select("player_id, player_name, obby_id, time_taken, replay_path, created_at")
+    .select([
+      "player_id",
+      "player_name",
+      "obby_id",
+      "time_taken",
+      "replay_path",
+      "created_at",
+      "average_fps",
+      "time_of_completion",
+      "completion_data",
+      "has_replay_data",
+      "replay_revision",
+      "replay_digest",
+      "submission_id",
+    ].join(", "))
     .eq("player_id", String(userId))
     .eq("obby_id", String(obbyId))
     .order("created_at", { ascending: false })
@@ -268,6 +426,9 @@ async function loadReplay(userId, obbyId) {
 
   const row = Array.isArray(leaderboardRows) ? leaderboardRows[0] : null;
   const metadata = extracted.metadata || {};
+  const replayFileState = metadata.hasReplayData
+    ?? metadata.has_replay_data
+    ?? (metadata.replayRemoved === true ? false : null);
 
   const payload = {
     success: true,
@@ -282,14 +443,35 @@ async function loadReplay(userId, obbyId) {
     timeTaken: row?.time_taken ?? metadata.timeTaken ?? null,
     createdAt: row?.created_at ?? metadata.savedAt ?? null,
 
-    avgFPS: metadata.avgFPS ?? metadata.averageFPS ?? metadata.AverageFPS ?? null,
-    timeOfCompletion: metadata.timeOfCompletion ?? metadata.TimeOfCompletion ?? null,
-    completionData: metadata.completionData ?? metadata.CompletionData ?? {},
+    avgFPS: row?.average_fps
+      ?? metadata.avgFPS
+      ?? metadata.averageFPS
+      ?? metadata.AverageFPS
+      ?? null,
+    timeOfCompletion: row?.time_of_completion
+      ?? metadata.timeOfCompletion
+      ?? metadata.TimeOfCompletion
+      ?? null,
+    completionData: row?.completion_data
+      ?? metadata.completionData
+      ?? metadata.CompletionData
+      ?? {},
+
+    hasReplayData: replayFileState ?? row?.has_replay_data ?? true,
 
     obbyVersion: metadata.obbyVersion ?? metadata.ObbyVersion ?? null,
-    submissionId: metadata.submissionId ?? metadata.SubmissionId ?? null,
-    replayRevision: metadata.replayRevision ?? metadata.ReplayRevision ?? null,
-    replayDigest: metadata.replayDigest ?? metadata.ReplayDigest ?? null,
+    submissionId: row?.submission_id
+      ?? metadata.submissionId
+      ?? metadata.SubmissionId
+      ?? null,
+    replayRevision: row?.replay_revision
+      ?? metadata.replayRevision
+      ?? metadata.ReplayRevision
+      ?? null,
+    replayDigest: row?.replay_digest
+      ?? metadata.replayDigest
+      ?? metadata.ReplayDigest
+      ?? null,
   };
 
   payload.data = {
@@ -307,7 +489,27 @@ async function loadReplay(userId, obbyId) {
     submissionId: payload.submissionId,
     replayRevision: payload.replayRevision,
     replayDigest: payload.replayDigest,
+    hasReplayData: payload.hasReplayData,
   };
+
+  // Older rows predate summary metadata. Opening a replay upgrades its row so
+  // future leaderboard pages can remain summary-only.
+  const needsMetadataBackfill = row && (
+    row.time_of_completion == null
+    || row.average_fps == null
+    || row.completion_data == null
+    || row.has_replay_data == null
+    || (replayFileState != null && row.has_replay_data !== replayFileState)
+  );
+  if (needsMetadataBackfill) {
+    void backfillLeaderboardMetadata(userId, obbyId, replayPath, payload).catch((error) => {
+      console.warn("leaderboard metadata backfill failed", {
+        userId: String(userId),
+        obbyId: String(obbyId),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
 
   return {
     status: 200,
@@ -344,6 +546,7 @@ app.post("/save-replay", async (req, res) => {
 
     const replayPath = getReplayPath(userId, obbyId);
     const metadata = getMetadataFromBody(req.body);
+    const hasReplayData = getReplayStatusFromBody(req.body);
     const obbyVersion = normalizeObbyVersion(
       req.body.obbyVersion ?? req.body.ObbyVersion
     );
@@ -400,6 +603,13 @@ app.post("/save-replay", async (req, res) => {
         obbyVersion,
         timeTaken,
         replayPath,
+        averageFPS: metadata.avgFPS,
+        timeOfCompletion: metadata.timeOfCompletion,
+        completionData: metadata.completionData,
+        hasReplayData,
+        replayRevision: replayFileBody.replayRevision,
+        replayDigest: replayFileBody.replayDigest,
+        submissionId: replayFileBody.submissionId,
       }
     );
 
@@ -409,6 +619,8 @@ app.post("/save-replay", async (req, res) => {
         error: dbError.message,
       });
     }
+
+    invalidateLeaderboardCache(obbyId);
 
     res.json({
       success: true,
@@ -505,6 +717,7 @@ app.get("/obby-replays/:obbyId/:fileName", async (req, res) => {
 });
 
 app.get("/leaderboard/:obbyId", async (req, res) => {
+  const startedAt = Date.now();
   const { obbyId } = req.params;
   const parsedLimit = Number.parseInt(req.query.limit, 10);
   const limit = Number.isFinite(parsedLimit)
@@ -521,31 +734,26 @@ app.get("/leaderboard/:obbyId", async (req, res) => {
     });
   }
 
-  let query = supabase
-    .from(LEADERBOARD_TABLE)
-    .select("id, player_id, player_name, obby_id, obby_version, time_taken, replay_path, created_at")
-    .eq("obby_id", obbyId)
-    .order("time_taken", { ascending: true })
-    .order("created_at", { ascending: true })
-    .order("id", { ascending: true });
-
-  if (expectedObbyVersion) {
-    query = query.eq("obby_version", expectedObbyVersion);
-  }
-
-  const { data, error } = await query.limit(limit);
-
-  if (error) {
+  let snapshot;
+  try {
+    snapshot = await loadLeaderboardSnapshot(obbyId, expectedObbyVersion);
+  } catch (error) {
     return res.status(500).json({
       success: false,
-      error: error.message,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
+
+  const rows = snapshot.rows.slice(0, limit);
 
   res.json({
     success: true,
     limit,
-    rows: data,
+    rows,
+    hasMore: snapshot.rows.length > rows.length,
+    cacheHit: snapshot.cacheHit === true,
+    coalesced: snapshot.coalesced === true,
+    durationMs: Date.now() - startedAt,
   });
 });
 
@@ -563,6 +771,10 @@ app.post("/purge-obby-replays", async (req, res) => {
     obbyId: req.body.obbyId,
     replacementVersion: req.body.replacementVersion,
   });
+
+  if (result.status >= 200 && result.status < 300) {
+    invalidateLeaderboardCache(req.body.obbyId);
+  }
 
   res.status(result.status).json(result.body);
 });
