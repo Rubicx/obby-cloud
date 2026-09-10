@@ -426,6 +426,13 @@ async function loadReplay(userId, obbyId) {
 
   const row = Array.isArray(leaderboardRows) ? leaderboardRows[0] : null;
   const metadata = extracted.metadata || {};
+  const replayFileCompletionData = metadata.completionData ?? metadata.CompletionData;
+  const hasReplayFileCompletionData = replayFileCompletionData
+    && typeof replayFileCompletionData === "object"
+    && Object.keys(replayFileCompletionData).length > 0;
+  const replayFileCompletionTime = metadata.timeOfCompletion
+    ?? metadata.TimeOfCompletion
+    ?? null;
   const replayFileState = metadata.hasReplayData
     ?? metadata.has_replay_data
     ?? (metadata.replayRemoved === true ? false : null);
@@ -448,14 +455,10 @@ async function loadReplay(userId, obbyId) {
       ?? metadata.averageFPS
       ?? metadata.AverageFPS
       ?? null,
-    timeOfCompletion: row?.time_of_completion
-      ?? metadata.timeOfCompletion
-      ?? metadata.TimeOfCompletion
-      ?? null,
-    completionData: row?.completion_data
-      ?? metadata.completionData
-      ?? metadata.CompletionData
-      ?? {},
+    timeOfCompletion: replayFileCompletionTime ?? row?.time_of_completion ?? null,
+    completionData: hasReplayFileCompletionData
+      ? replayFileCompletionData
+      : (row?.completion_data ?? {}),
 
     hasReplayData: replayFileState ?? row?.has_replay_data ?? true,
 
@@ -499,6 +502,11 @@ async function loadReplay(userId, obbyId) {
     || row.average_fps == null
     || row.completion_data == null
     || row.has_replay_data == null
+    || (hasReplayFileCompletionData && Object.keys(row.completion_data || {}).length === 0)
+    || (
+      Number.isFinite(Number(replayFileCompletionTime))
+      && Number(row.time_of_completion) !== Math.floor(Number(replayFileCompletionTime))
+    )
     || (replayFileState != null && row.has_replay_data !== replayFileState)
   );
   if (needsMetadataBackfill) {
