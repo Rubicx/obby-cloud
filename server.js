@@ -6,6 +6,11 @@ const {
 } = require("./replayWriteAuth");
 const { saveLeaderboardRow } = require("./leaderboardStore");
 const { purgeObbyReplayData } = require("./obbyPurge");
+const { purgePlayerReplayData } = require("./playerPurge");
+const {
+  buildModerationDiscordMessage,
+  postDiscordWebhook,
+} = require("./moderationWebhook");
 const {
   getExpectedObbyVersion,
   normalizeObbyVersion,
@@ -22,16 +27,23 @@ app.use(
   "/save-replay",
   createReplayWriteAuth(BACKEND_WRITE_SECRET)
 );
+app.use(
+  "/moderation-webhook",
+  createReplayWriteAuth(BACKEND_WRITE_SECRET)
+);
 app.use(express.json({ limit: "10mb" }));
 
 const BUCKET_NAME = process.env.SUPABASE_REPLAY_BUCKET || "obby-replays";
 const LEADERBOARD_TABLE = process.env.SUPABASE_LEADERBOARD_TABLE || "leaderboard";
 const REPLAY_DELETE_SECRET = process.env.REPLAY_DELETE_SECRET || "";
+const DISCORD_MODERATION_WEBHOOK_URL = process.env.DISCORD_MODERATION_WEBHOOK_URL || "";
 const LEADERBOARD_CACHE_TTL_MS = 15_000;
 const LEADERBOARD_CACHE_MAX_ENTRIES = 250;
 
 const leaderboardCache = new Map();
 const leaderboardLoads = new Map();
+const deliveredModerationActions = new Map();
+const MODERATION_ACTION_TTL_MS = 10 * 60 * 1000;
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -60,6 +72,14 @@ function getReplayStatusFromBody(body) {
 
 function invalidateLeaderboardCache(obbyId) {
   leaderboardCache.delete(String(obbyId));
+}
+
+function pruneModerationActionCache(now = Date.now()) {
+  for (const [actionId, expiresAt] of deliveredModerationActions) {
+    if (expiresAt <= now) {
+      deliveredModerationActions.delete(actionId);
+    }
+  }
 }
 
 function trimLeaderboardCache() {
@@ -785,6 +805,68 @@ app.post("/purge-obby-replays", async (req, res) => {
   }
 
   res.status(result.status).json(result.body);
+});
+
+app.post("/purge-player-replays", async (req, res) => {
+  if (!isDeleteAuthorized(req)) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized player purge request",
+    });
+  }
+
+  const result = await purgePlayerReplayData(supabase, {
+    bucketName: BUCKET_NAME,
+    leaderboardTable: LEADERBOARD_TABLE,
+    playerId: req.body.playerId ?? req.body.userId,
+  });
+
+  if (result.status >= 200 && result.status < 300) {
+    for (const obbyId of result.body.obbyIds || []) {
+      invalidateLeaderboardCache(obbyId);
+    }
+  }
+
+  res.status(result.status).json(result.body);
+});
+
+app.post("/moderation-webhook", async (req, res) => {
+  const actionId = String(req.body?.actionId ?? "").trim().slice(0, 200);
+  if (!actionId) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing actionId",
+    });
+  }
+
+  pruneModerationActionCache();
+  if (deliveredModerationActions.has(actionId)) {
+    return res.json({ success: true, duplicate: true });
+  }
+
+  try {
+    const delivery = await postDiscordWebhook(
+      DISCORD_MODERATION_WEBHOOK_URL,
+      buildModerationDiscordMessage(req.body)
+    );
+
+    deliveredModerationActions.set(actionId, Date.now() + MODERATION_ACTION_TTL_MS);
+    return res.json({
+      success: true,
+      attempts: delivery.attempts,
+      discordStatus: delivery.status,
+    });
+  } catch (error) {
+    console.error("moderation webhook delivery failed", {
+      actionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return res.status(502).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
