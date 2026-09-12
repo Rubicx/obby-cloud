@@ -2,6 +2,7 @@ const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 const {
   createReplayWriteAuth,
+  secretMatchesHex,
   secretsMatch,
 } = require("./replayWriteAuth");
 const { saveLeaderboardRow } = require("./leaderboardStore");
@@ -278,11 +279,23 @@ function getDeleteSecretFromRequest(req) {
   );
 }
 
+function getDeleteSecretHexFromRequest(req) {
+  return (
+    req.get("x-backend-delete-secret-hex")
+    || req.get("x-replay-delete-secret-hex")
+    || req.get("x-backend-write-secret-hex")
+    || ""
+  );
+}
+
 function isDeleteAuthorized(req) {
   // Missing configuration must disable deletion instead of exposing it.
   const suppliedSecret = getDeleteSecretFromRequest(req);
+  const suppliedHex = getDeleteSecretHexFromRequest(req);
   return secretsMatch(REPLAY_DELETE_SECRET, suppliedSecret)
-    || secretsMatch(BACKEND_WRITE_SECRET, suppliedSecret);
+    || secretsMatch(BACKEND_WRITE_SECRET, suppliedSecret)
+    || secretMatchesHex(REPLAY_DELETE_SECRET, suppliedHex)
+    || secretMatchesHex(BACKEND_WRITE_SECRET, suppliedHex);
 }
 
 async function deleteLeaderboardRows(userId, obbyId, replayPath) {

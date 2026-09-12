@@ -3,18 +3,24 @@ const assert = require("node:assert/strict");
 
 const {
   createReplayWriteAuth,
+  secretMatchesHex,
   secretsMatch,
 } = require("../replayWriteAuth");
 
-function runMiddleware(configuredSecret, providedSecret) {
+function runMiddleware(configuredSecret, providedSecret, providedHex) {
   let statusCode = null;
   let responseBody = null;
   let nextCalled = false;
 
   const req = {
     get(name) {
-      assert.equal(name, "x-backend-write-secret");
-      return providedSecret;
+      if (name === "x-backend-write-secret") {
+        return providedSecret;
+      }
+      if (name === "x-backend-write-secret-hex") {
+        return providedHex;
+      }
+      assert.fail(`Unexpected header lookup: ${name}`);
     },
   };
   const res = {
@@ -37,6 +43,16 @@ function runMiddleware(configuredSecret, providedSecret) {
 
 test("accepts an exact write-secret match", () => {
   const result = runMiddleware("correct-secret", "correct-secret");
+
+  assert.equal(result.nextCalled, true);
+  assert.equal(result.statusCode, null);
+  assert.equal(result.responseBody, null);
+});
+
+test("accepts a hex-encoded write secret for Roblox-safe headers", () => {
+  const configuredSecret = "unsafe^#$%%^@#secret";
+  const encoded = Buffer.from(configuredSecret, "utf8").toString("hex");
+  const result = runMiddleware(configuredSecret, undefined, encoded);
 
   assert.equal(result.nextCalled, true);
   assert.equal(result.statusCode, null);
@@ -71,6 +87,14 @@ test("secret comparison requires non-empty strings and exact content", () => {
   assert.equal(secretsMatch("same", "Same"), false);
   assert.equal(secretsMatch("", ""), false);
   assert.equal(secretsMatch("same", undefined), false);
+});
+
+test("hex secret comparison rejects malformed and incorrect values", () => {
+  assert.equal(secretMatchesHex("same", Buffer.from("same").toString("hex")), true);
+  assert.equal(secretMatchesHex("same", Buffer.from("other").toString("hex")), false);
+  assert.equal(secretMatchesHex("same", "xyz"), false);
+  assert.equal(secretMatchesHex("same", "0"), false);
+  assert.equal(secretMatchesHex("", "00"), false);
 });
 
 test("delete-style authorization also fails closed without configuration", () => {

@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 
 const WRITE_SECRET_HEADER = "x-backend-write-secret";
+const WRITE_SECRET_HEX_HEADER = "x-backend-write-secret-hex";
 
 function secretsMatch(expectedSecret, providedSecret) {
   if (
@@ -25,6 +26,24 @@ function secretsMatch(expectedSecret, providedSecret) {
   return crypto.timingSafeEqual(expectedDigest, providedDigest);
 }
 
+function secretMatchesHex(expectedSecret, providedHex) {
+  if (
+    typeof expectedSecret !== "string"
+    || expectedSecret.length === 0
+    || typeof providedHex !== "string"
+    || providedHex.length === 0
+    || providedHex.length % 2 !== 0
+    || !/^[0-9a-f]+$/i.test(providedHex)
+  ) {
+    return false;
+  }
+
+  return secretsMatch(
+    Buffer.from(expectedSecret, "utf8").toString("hex"),
+    providedHex.toLowerCase()
+  );
+}
+
 function createReplayWriteAuth(configuredSecret) {
   return function requireReplayWriteAuth(req, res, next) {
     if (typeof configuredSecret !== "string" || configuredSecret.length === 0) {
@@ -35,7 +54,11 @@ function createReplayWriteAuth(configuredSecret) {
     }
 
     const providedSecret = req.get(WRITE_SECRET_HEADER);
-    if (!secretsMatch(configuredSecret, providedSecret)) {
+    const providedHex = req.get(WRITE_SECRET_HEX_HEADER);
+    if (
+      !secretsMatch(configuredSecret, providedSecret)
+      && !secretMatchesHex(configuredSecret, providedHex)
+    ) {
       return res.status(401).json({
         success: false,
         error: "Unauthorized replay write",
@@ -48,6 +71,8 @@ function createReplayWriteAuth(configuredSecret) {
 
 module.exports = {
   WRITE_SECRET_HEADER,
+  WRITE_SECRET_HEX_HEADER,
   createReplayWriteAuth,
+  secretMatchesHex,
   secretsMatch,
 };
